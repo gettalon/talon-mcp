@@ -1,0 +1,42 @@
+{
+  "name": "@gettalon/mcp",
+  "version": "2.0.0",
+  "description": "Standalone MCP server for Talon browser control via Chrome DevTools Protocol",
+  "bin": {
+    "talon-mcp": "./dist/index.js"
+  },
+  "main": "./dist/index.js",
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.27.1",
+    "sharp": "^0.34.5",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/sharp": "^0.31.1",
+    "@types/ws": "^8.5.0",
+    "typescript": "^5.5.0"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/gettalon/talon-mcp"
+  },
+  "keywords": [
+    "mcp",
+    "browser",
+    "chrome",
+    "cdp",
+    "claude-code",
+    "talon"
+  ]
+}
