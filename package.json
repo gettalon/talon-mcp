@@ -1,9 +1,10 @@
 {
   "name": "@gettalon/mcp",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "description": "Standalone MCP server for Talon browser control via Chrome DevTools Protocol",
   "bin": {
-    "talon-mcp": "./dist/index.js"
+    "talon-mcp": "./dist/index.js",
+    "talon-hook": "./dist/channel-sdk/hook-script.js"
   },
   "main": "./dist/index.js",
   "type": "module",
@@ -15,7 +16,8 @@
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.27.1",
     "sharp": "^0.34.5",
-    "ws": "^8.18.0"
+    "ws": "^8.18.0",
+    "zod": "^4.3.6"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",

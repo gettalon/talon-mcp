@@ -9,10 +9,13 @@ import { dirname } from "node:path";
 const DEFAULT_PORT = 21567;
 const COMMAND_TIMEOUT_MS = 30_000;
 const TALON_DIR = join(homedir(), ".talon");
+/** Regex matching "yes <id>" or "no <id>" for permission relay from browser */
+const PERMISSION_REPLY_RE = /^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$/i;
 export class BrowserBridgeServer {
     client = null;
     pending = new Map();
     chatHandler = null;
+    permissionVerdictHandler = null;
     authToken;
     port;
     reusing = false;
@@ -112,6 +115,11 @@ export class BrowserBridgeServer {
                                 },
                             }));
                         }
+                        return;
+                    }
+                    // Permission verdict from extension
+                    if (msg.type === "permission_verdict" && msg.request_id && this.permissionVerdictHandler) {
+                        this.permissionVerdictHandler(msg.request_id, msg.behavior === "allow" ? "allow" : "deny");
                         return;
                     }
                     // Bridge protocol chat message from extension (fallback)
@@ -350,6 +358,29 @@ export class BrowserBridgeServer {
     }
     sendStatus(message) {
         this.sendEvent({ type: "status", message });
+    }
+    // ─── Channel SDK integration ────────────────────────────────────────────
+    /** Forward a hook event to the browser extension */
+    sendHookEvent(input) {
+        this.sendEvent({
+            type: "hook_event",
+            hook_event_name: input.hook_event_name,
+            data: input,
+        });
+    }
+    /** Forward a permission relay request to the browser extension */
+    sendPermissionRequest(request) {
+        this.sendEvent({
+            type: "permission_request",
+            request_id: request.request_id,
+            tool_name: request.tool_name,
+            description: request.description,
+            input_preview: request.input_preview,
+        });
+    }
+    /** Register handler for permission verdicts from browser extension */
+    onPermissionVerdict(handler) {
+        this.permissionVerdictHandler = handler;
     }
     proxyWs = null;
     proxyPending = new Map();

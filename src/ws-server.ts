@@ -7,6 +7,7 @@ import { homedir, platform } from "node:os";
 import { fileURLToPath } from "node:url";
 import { dirname } from "node:path";
 import type { BrowserCommand, BrowserCommandResponse } from "./types.js";
+import type { HookEventInput, ChannelPermissionRequest } from "./channel-sdk/types.js";
 
 const DEFAULT_PORT = 21567;
 const COMMAND_TIMEOUT_MS = 30_000;
@@ -19,11 +20,16 @@ interface PendingRequest {
 }
 
 type ChatHandler = (chatId: string, text: string, context?: Record<string, string>) => void;
+type PermissionVerdictHandler = (requestId: string, behavior: "allow" | "deny") => void;
+
+/** Regex matching "yes <id>" or "no <id>" for permission relay from browser */
+const PERMISSION_REPLY_RE = /^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$/i;
 
 export class BrowserBridgeServer {
   private client: WebSocket | null = null;
   private pending = new Map<string, PendingRequest>();
   private chatHandler: ChatHandler | null = null;
+  private permissionVerdictHandler: PermissionVerdictHandler | null = null;
   private authToken: string;
   private port: number;
   private reusing = false;
@@ -134,6 +140,12 @@ export class BrowserBridgeServer {
                 },
               }));
             }
+            return;
+          }
+
+          // Permission verdict from extension
+          if (msg.type === "permission_verdict" && msg.request_id && this.permissionVerdictHandler) {
+            this.permissionVerdictHandler(msg.request_id, msg.behavior === "allow" ? "allow" : "deny");
             return;
           }
 
@@ -392,6 +404,33 @@ export class BrowserBridgeServer {
 
   sendStatus(message: string): void {
     this.sendEvent({ type: "status", message });
+  }
+
+  // ─── Channel SDK integration ────────────────────────────────────────────
+
+  /** Forward a hook event to the browser extension */
+  sendHookEvent(input: HookEventInput): void {
+    this.sendEvent({
+      type: "hook_event",
+      hook_event_name: input.hook_event_name,
+      data: input,
+    });
+  }
+
+  /** Forward a permission relay request to the browser extension */
+  sendPermissionRequest(request: ChannelPermissionRequest): void {
+    this.sendEvent({
+      type: "permission_request",
+      request_id: request.request_id,
+      tool_name: request.tool_name,
+      description: request.description,
+      input_preview: request.input_preview,
+    });
+  }
+
+  /** Register handler for permission verdicts from browser extension */
+  onPermissionVerdict(handler: PermissionVerdictHandler): void {
+    this.permissionVerdictHandler = handler;
   }
 
   private proxyWs: WebSocket | null = null;

@@ -1,8 +1,11 @@
+import type { HookEventInput, ChannelPermissionRequest } from "./channel-sdk/types.js";
 type ChatHandler = (chatId: string, text: string, context?: Record<string, string>) => void;
+type PermissionVerdictHandler = (requestId: string, behavior: "allow" | "deny") => void;
 export declare class BrowserBridgeServer {
     private client;
     private pending;
     private chatHandler;
+    private permissionVerdictHandler;
     private authToken;
     private port;
     private reusing;
@@ -29,6 +32,12 @@ export declare class BrowserBridgeServer {
     sendStreamEnd(text?: string): void;
     sendToolProgress(callId: string, toolName: string, elapsed: number): void;
     sendStatus(message: string): void;
+    /** Forward a hook event to the browser extension */
+    sendHookEvent(input: HookEventInput): void;
+    /** Forward a permission relay request to the browser extension */
+    sendPermissionRequest(request: ChannelPermissionRequest): void;
+    /** Register handler for permission verdicts from browser extension */
+    onPermissionVerdict(handler: PermissionVerdictHandler): void;
     private proxyWs;
     private proxyPending;
     private ensureProxyConnection;
