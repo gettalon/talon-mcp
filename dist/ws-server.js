@@ -9,8 +9,59 @@ import { dirname } from "node:path";
 const DEFAULT_PORT = 21567;
 const COMMAND_TIMEOUT_MS = 30_000;
 const TALON_DIR = join(homedir(), ".talon");
-/** Regex matching "yes <id>" or "no <id>" for permission relay from browser */
-const PERMISSION_REPLY_RE = /^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$/i;
+/** Map from category to which hook event names it includes */
+const CATEGORY_EVENTS = {
+    chat: new Set(), // chat is handled separately, not via hook events
+    tools: new Set(["PreToolUse", "PostToolUse", "PostToolUseFailure"]),
+    permissions: new Set(["PermissionRequest"]),
+    session: new Set(["SessionStart", "SessionEnd"]),
+    notifications: new Set(["Notification"]),
+    subagents: new Set(["SubagentStart", "SubagentStop"]),
+    lifecycle: new Set(["Stop", "StopFailure", "TeammateIdle", "TaskCompleted"]),
+    filesystem: new Set(["FileChanged", "CwdChanged", "ConfigChange", "InstructionsLoaded"]),
+    worktree: new Set(["WorktreeCreate", "WorktreeRemove"]),
+    compact: new Set(["PreCompact", "PostCompact"]),
+    elicitation: new Set(["Elicitation", "ElicitationResult"]),
+    prompts: new Set(["UserPromptSubmit"]),
+};
+/** Resolve mode → set of allowed hook event names */
+function resolveAllowedEvents(config) {
+    switch (config.mode) {
+        case "chat":
+            return new Set(); // no hook events, only chat
+        case "monitor":
+        case "full":
+            return "all";
+        case "custom": {
+            const allowed = new Set();
+            for (const cat of config.enabledCategories ?? []) {
+                for (const ev of CATEGORY_EVENTS[cat]) {
+                    allowed.add(ev);
+                }
+            }
+            return allowed;
+        }
+    }
+}
+/** Check if mode allows permission relay (bidirectional) */
+function modeAllowsPermissions(config) {
+    if (config.mode === "full")
+        return true;
+    if (config.mode === "custom") {
+        return config.enabledCategories?.includes("permissions") ?? false;
+    }
+    return false; // chat and monitor are passive
+}
+/** Check if mode allows chat (sending messages to Claude) */
+function modeAllowsChat(config) {
+    if (config.mode === "monitor")
+        return false; // read-only
+    if (config.mode === "custom") {
+        return config.enabledCategories?.includes("chat") ?? false;
+    }
+    return true; // chat and full both allow chat
+}
+// ─── BrowserBridgeServer ─────────────────────────────────────────────────────
 export class BrowserBridgeServer {
     client = null;
     pending = new Map();
@@ -19,18 +70,50 @@ export class BrowserBridgeServer {
     authToken;
     port;
     reusing = false;
+    // Mode state
+    clientMode = { mode: "full" };
+    allowedEvents = "all";
+    allowsPermissions = true;
+    allowsChat = true;
     constructor(port) {
         this.port = port ?? DEFAULT_PORT;
         this.authToken = randomUUID();
     }
-    /** Check if an existing talon-mcp is already running on this port. Returns true if reusable. */
+    // ─── Mode API ──────────────────────────────────────────────────────────
+    /** Get current client mode */
+    getMode() {
+        return this.clientMode;
+    }
+    /** Set client mode — controls what events are forwarded to the browser */
+    setMode(config) {
+        this.clientMode = config;
+        this.allowedEvents = resolveAllowedEvents(config);
+        this.allowsPermissions = modeAllowsPermissions(config);
+        this.allowsChat = modeAllowsChat(config);
+        process.stderr.write(`[talon-mcp] Mode set to: ${config.mode}\n`);
+        // Notify browser of mode change
+        this.sendEvent({
+            type: "mode_changed",
+            mode: config.mode,
+            categories: config.enabledCategories ?? [],
+            allows_chat: this.allowsChat,
+            allows_permissions: this.allowsPermissions,
+        });
+    }
+    /** Check if a hook event should be forwarded to the browser */
+    shouldForwardHook(eventName) {
+        if (this.allowedEvents === "all")
+            return true;
+        return this.allowedEvents.has(eventName);
+    }
+    // ─── Connection ────────────────────────────────────────────────────────
+    /** Check if an existing talon-mcp is already running on this port */
     async checkExisting() {
         try {
             const resp = await fetch(`http://localhost:${this.port}/health`, { signal: AbortSignal.timeout(1000) });
             const data = await resp.json();
             if (data.service === "talon-mcp") {
                 process.stderr.write(`[talon-mcp] Reusing existing server on port ${this.port}\n`);
-                // Get the token from the existing server
                 const authResp = await fetch(`http://localhost:${this.port}/auth/local`, { method: "POST", signal: AbortSignal.timeout(1000) });
                 const authData = await authResp.json();
                 if (authData.token) {
@@ -43,7 +126,6 @@ export class BrowserBridgeServer {
         return false;
     }
     async start() {
-        // Check if an existing talon-mcp is already running — reuse it
         const existing = await this.checkExisting();
         if (existing) {
             this.reusing = true;
@@ -53,7 +135,6 @@ export class BrowserBridgeServer {
         await new Promise((resolve, reject) => {
             httpServer.once("error", (err) => {
                 if (err.code === "EADDRINUSE") {
-                    // Port taken by non-talon process, use random
                     process.stderr.write(`[talon-mcp] Port ${this.port} in use by another process, using random port\n`);
                     httpServer.listen(0, () => {
                         this.port = httpServer.address().port;
@@ -72,7 +153,6 @@ export class BrowserBridgeServer {
         if (!httpServer.listening) {
             throw new Error("Could not bind to any port");
         }
-        // Create WebSocket server AFTER successful port binding
         const wss = new WebSocketServer({ server: httpServer, path: "/ws" });
         this.writeDiscoveryFiles();
         process.stderr.write(`[talon-mcp] Server listening on port ${this.port}\n`);
@@ -83,8 +163,28 @@ export class BrowserBridgeServer {
                 ws.close(4001, "Invalid token");
                 return;
             }
+            // Parse initial mode from query string: ?mode=chat|monitor|full|custom&categories=tools,permissions
+            const modeParam = url.searchParams.get("mode");
+            if (modeParam && ["chat", "monitor", "full", "custom"].includes(modeParam)) {
+                const categories = (url.searchParams.get("categories") ?? "")
+                    .split(",")
+                    .filter(Boolean);
+                this.setMode({
+                    mode: modeParam,
+                    ...(modeParam === "custom" ? { enabledCategories: categories } : {}),
+                });
+            }
             this.client = ws;
-            process.stderr.write(`[talon-mcp] Chrome extension connected (readyState=${ws.readyState})\n`);
+            process.stderr.write(`[talon-mcp] Chrome extension connected (mode=${this.clientMode.mode})\n`);
+            // Send capabilities announcement on connect
+            this.sendEvent({
+                type: "connected",
+                mode: this.clientMode.mode,
+                allows_chat: this.allowsChat,
+                allows_permissions: this.allowsPermissions,
+                available_modes: ["chat", "monitor", "full", "custom"],
+                available_categories: Object.keys(CATEGORY_EVENTS),
+            });
             ws.on("message", (data) => {
                 try {
                     const msg = JSON.parse(data.toString());
@@ -98,32 +198,45 @@ export class BrowserBridgeServer {
                         }
                         return;
                     }
-                    // RC protocol request (send_message) from extension
-                    if (msg.type === "request" && msg.method === "send_message" && msg.params && this.chatHandler) {
-                        const chatId = msg.params.conversation_id || `chat-${Date.now()}`;
-                        this.lastChatId = chatId;
-                        const text = msg.params.message || "";
-                        this.chatHandler(chatId, text, {});
-                        // Send response back to extension so it knows message was received
-                        if (this.client && msg.id) {
-                            this.wsSend(JSON.stringify({
-                                seq: this.seqCounter++,
-                                payload: {
-                                    type: "response",
-                                    id: msg.id,
-                                    result: { ok: true },
-                                },
-                            }));
-                        }
+                    // Mode switch from extension
+                    if (msg.type === "set_mode") {
+                        this.setMode({
+                            mode: msg.mode ?? "full",
+                            enabledCategories: msg.categories,
+                        });
                         return;
                     }
                     // Permission verdict from extension
                     if (msg.type === "permission_verdict" && msg.request_id && this.permissionVerdictHandler) {
+                        if (!this.allowsPermissions) {
+                            process.stderr.write(`[talon-mcp] Permission verdict ignored — not allowed in ${this.clientMode.mode} mode\n`);
+                            return;
+                        }
                         this.permissionVerdictHandler(msg.request_id, msg.behavior === "allow" ? "allow" : "deny");
+                        return;
+                    }
+                    // RC protocol request (send_message) from extension
+                    if (msg.type === "request" && msg.method === "send_message" && msg.params && this.chatHandler) {
+                        if (!this.allowsChat) {
+                            process.stderr.write(`[talon-mcp] Chat message ignored — not allowed in ${this.clientMode.mode} mode\n`);
+                            return;
+                        }
+                        const chatId = msg.params.conversation_id || `chat-${Date.now()}`;
+                        this.lastChatId = chatId;
+                        const text = msg.params.message || "";
+                        this.chatHandler(chatId, text, {});
+                        if (this.client && msg.id) {
+                            this.wsSend(JSON.stringify({
+                                seq: this.seqCounter++,
+                                payload: { type: "response", id: msg.id, result: { ok: true } },
+                            }));
+                        }
                         return;
                     }
                     // Bridge protocol chat message from extension (fallback)
                     if (msg.type === "chat_message" && msg.text && this.chatHandler) {
+                        if (!this.allowsChat)
+                            return;
                         const chatId = msg.conversation_id || `chat-${Date.now()}`;
                         const context = {};
                         if (msg.context?.url)
@@ -151,6 +264,7 @@ export class BrowserBridgeServer {
             });
         });
     }
+    // ─── Discovery & Native Host ───────────────────────────────────────────
     writeDiscoveryFiles() {
         try {
             mkdirSync(TALON_DIR, { recursive: true });
@@ -165,7 +279,6 @@ export class BrowserBridgeServer {
     }
     installNativeMessagingHost() {
         try {
-            // Determine native messaging hosts directory
             const home = homedir();
             let hostsDir;
             if (platform() === "darwin") {
@@ -175,18 +288,15 @@ export class BrowserBridgeServer {
                 hostsDir = join(home, ".config", "google-chrome", "NativeMessagingHosts");
             }
             else {
-                // Windows: HKCU registry — skip auto-install
                 return;
             }
             mkdirSync(hostsDir, { recursive: true });
-            // Find the native host script path
             const thisFile = fileURLToPath(import.meta.url);
             const hostScript = join(dirname(thisFile), "..", "native-host", "talon-native-host.js");
             if (!existsSync(hostScript)) {
                 process.stderr.write(`[talon-mcp] Native host script not found at ${hostScript}\n`);
                 return;
             }
-            // Find installed extension ID by scanning Chrome extensions dir
             const extId = this.findExtensionId();
             const manifest = {
                 name: "com.gettalon.mcp",
@@ -195,7 +305,7 @@ export class BrowserBridgeServer {
                 type: "stdio",
                 allowed_origins: extId
                     ? [`chrome-extension://${extId}/`]
-                    : ["chrome-extension://*/"], // allow any if ID unknown
+                    : ["chrome-extension://*/"],
             };
             const manifestPath = join(hostsDir, "com.gettalon.mcp.json");
             writeFileSync(manifestPath, JSON.stringify(manifest, null, 2));
@@ -206,7 +316,6 @@ export class BrowserBridgeServer {
         }
     }
     findExtensionId() {
-        // Try to find the Talon Browser Control extension ID from Chrome's Extensions dir
         try {
             const home = homedir();
             let extDir;
@@ -218,7 +327,6 @@ export class BrowserBridgeServer {
             }
             if (!existsSync(extDir))
                 return null;
-            // Scan extension dirs for one containing our manifest name
             for (const id of readdirSync(extDir)) {
                 try {
                     const versions = readdirSync(join(extDir, id));
@@ -250,10 +358,25 @@ export class BrowserBridgeServer {
             // ignore
         }
     }
+    // ─── HTTP ──────────────────────────────────────────────────────────────
     handleHttp(req, res) {
+        // CORS headers for browser access
+        res.setHeader("Access-Control-Allow-Origin", "*");
+        res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+        res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+        if (req.method === "OPTIONS") {
+            res.writeHead(204);
+            res.end();
+            return;
+        }
         if (req.url === "/health" && req.method === "GET") {
             res.writeHead(200, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ status: "ok", service: "talon-mcp" }));
+            res.end(JSON.stringify({
+                status: "ok",
+                service: "talon-mcp",
+                mode: this.clientMode.mode,
+                connected: this.isConnected,
+            }));
             return;
         }
         if (req.url === "/auth/local" && req.method === "POST") {
@@ -261,11 +384,45 @@ export class BrowserBridgeServer {
             res.end(JSON.stringify({ token: this.authToken }));
             return;
         }
+        // GET /mode — current mode info
+        if (req.url === "/mode" && req.method === "GET") {
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({
+                mode: this.clientMode.mode,
+                categories: this.clientMode.enabledCategories ?? [],
+                allows_chat: this.allowsChat,
+                allows_permissions: this.allowsPermissions,
+                available_modes: ["chat", "monitor", "full", "custom"],
+                available_categories: Object.keys(CATEGORY_EVENTS),
+            }));
+            return;
+        }
+        // POST /mode — switch mode via HTTP
+        if (req.url === "/mode" && req.method === "POST") {
+            let body = "";
+            req.on("data", (chunk) => { body += chunk; });
+            req.on("end", () => {
+                try {
+                    const data = JSON.parse(body);
+                    this.setMode({
+                        mode: data.mode ?? "full",
+                        enabledCategories: data.categories,
+                    });
+                    res.writeHead(200, { "Content-Type": "application/json" });
+                    res.end(JSON.stringify({ ok: true, mode: this.clientMode.mode }));
+                }
+                catch {
+                    res.writeHead(400, { "Content-Type": "application/json" });
+                    res.end(JSON.stringify({ error: "Invalid JSON" }));
+                }
+            });
+            return;
+        }
         res.writeHead(404);
         res.end("Not Found");
     }
+    // ─── Commands & Chat ───────────────────────────────────────────────────
     async sendCommand(action, params) {
-        // In reuse mode, proxy command through the existing server's WS
         if (this.reusing) {
             return this.proxyCommand(action, params);
         }
@@ -285,7 +442,6 @@ export class BrowserBridgeServer {
                 reject(new Error("Browser command timed out after 30 seconds"));
             }, COMMAND_TIMEOUT_MS);
             this.pending.set(requestId, { resolve, reject, timer });
-            // Wrap in seq envelope so extension doesn't disconnect
             this.wsSend(JSON.stringify({
                 seq: this.seqCounter++,
                 payload: cmd,
@@ -312,10 +468,8 @@ export class BrowserBridgeServer {
             return;
         }
         process.stderr.write(`[talon-mcp] sendChatReply chatId=${chatId} text=${text.substring(0, 100)}\n`);
-        // Use RC stream format with seq envelope (extension expects this when connectedToRc=true)
         let seq = Date.now();
         try {
-            // Turn started
             this.wsSend(JSON.stringify({ seq: seq++, payload: { type: "stream", conversation_id: chatId, event: { type: "turn_started" } } }));
             this.wsSend(JSON.stringify({ seq: seq++, payload: { type: "stream", conversation_id: chatId, event: { type: "text_delta", text } } }));
             this.wsSend(JSON.stringify({ seq: seq++, payload: { type: "stream", conversation_id: chatId, event: { type: "stream_end", fullText: text } } }));
@@ -324,6 +478,7 @@ export class BrowserBridgeServer {
             process.stderr.write(`[talon-mcp] Send error: ${err}\n`);
         }
     }
+    // ─── Event Sending ─────────────────────────────────────────────────────
     seqCounter = Date.now();
     lastChatId = null;
     setLastChatId(chatId) {
@@ -359,9 +514,11 @@ export class BrowserBridgeServer {
     sendStatus(message) {
         this.sendEvent({ type: "status", message });
     }
-    // ─── Channel SDK integration ────────────────────────────────────────────
-    /** Forward a hook event to the browser extension */
+    // ─── Channel SDK integration ──────────────────────────────────────────
+    /** Forward a hook event to the browser extension (respects mode filter) */
     sendHookEvent(input) {
+        if (!this.shouldForwardHook(input.hook_event_name))
+            return;
         this.sendEvent({
             type: "hook_event",
             hook_event_name: input.hook_event_name,
@@ -370,6 +527,22 @@ export class BrowserBridgeServer {
     }
     /** Forward a permission relay request to the browser extension */
     sendPermissionRequest(request) {
+        if (!this.allowsPermissions) {
+            // In non-permission modes, still forward as a read-only notification
+            if (this.clientMode.mode !== "chat") {
+                this.sendEvent({
+                    type: "hook_event",
+                    hook_event_name: "PermissionRequest",
+                    data: {
+                        type: "permission_request_readonly",
+                        tool_name: request.tool_name,
+                        description: request.description,
+                        input_preview: request.input_preview,
+                    },
+                });
+            }
+            return;
+        }
         this.sendEvent({
             type: "permission_request",
             request_id: request.request_id,
@@ -382,6 +555,7 @@ export class BrowserBridgeServer {
     onPermissionVerdict(handler) {
         this.permissionVerdictHandler = handler;
     }
+    // ─── Proxy (reuse existing server) ────────────────────────────────────
     proxyWs = null;
     proxyPending = new Map();
     async ensureProxyConnection() {
@@ -397,7 +571,6 @@ export class BrowserBridgeServer {
             ws.on("message", (data) => {
                 try {
                     let msg = JSON.parse(data.toString());
-                    // Unwrap seq envelope
                     if (msg.seq !== undefined && msg.payload)
                         msg = msg.payload;
                     if (msg.type === "browser_command_response" && msg.request_id) {
